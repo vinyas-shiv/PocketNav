@@ -9,46 +9,4 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_gravity="top"
-        android:layout_margin="16dp"
-        android:background="#CC0F172A"
-        android:orientation="vertical"
-        android:padding="16dp">
-
-        <TextView
-            android:id="@+id/tvDashboardStatus"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="DASHBOARD (OFFLINE) • LISTENING ON RFCOMM..."
-            android:textColor="#34D399"
-            android:textSize="13sp"
-            android:textStyle="bold"
-            android:typeface="monospace" />
-
-        <TextView
-            android:id="@+id/tvDashboardCoords"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="6dp"
-            android:text="LAT: --.------   LON: --.------"
-            android:textColor="#F8FAFC"
-            android:textSize="15sp"
-            android:textStyle="bold"
-            android:typeface="monospace" />
-
-        <TextView
-            android:id="@+id/tvDashboardMetrics"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="4dp"
-            android:text="SPD: 0.0 m/s (0.0 km/h) | BRG: 0.0° | TILT: 45.0° 3D"
-            android:textColor="#38BDF8"
-            android:textSize="13sp"
-            android:typeface="monospace" />
-
-    </LinearLayout>
-
 </FrameLayout>
