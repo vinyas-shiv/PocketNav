@@ -33,7 +33,6 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.DataOutputStream
-import java.io.File
 import java.io.IOException
 import java.io.InputStreamReader
 import java.net.HttpURLConnection
@@ -73,7 +72,7 @@ class CommanderForegroundService : Service() {
         val pi = PendingIntent.getActivity(this, 0, Intent(this, CommanderActivity::class.java), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val notif: Notification = NotificationCompat.Builder(this, channelId)
             .setContentTitle("PocketNav Commander (Pocket Mode)")
-            .setContentText("Streaming low-power GPS & road telemetry to Dashboard")
+            .setContentText("Streaming low-power GPS telemetry to Dashboard")
             .setSmallIcon(android.R.drawable.ic_menu_mylocation)
             .setContentIntent(pi)
             .setOngoing(true)
@@ -124,7 +123,6 @@ class CommanderActivity : AppCompatActivity() {
     private lateinit var routeStatusText: TextView
     private lateinit var shareUrlInput: EditText
     private lateinit var sendRouteButton: Button
-    private lateinit var downloadRegionButton: Button
     private lateinit var batteryOptButton: Button
     private lateinit var toggleStreamButton: Button
     private val pairedDevicesList = mutableListOf<BluetoothDevice>()
@@ -140,7 +138,6 @@ class CommanderActivity : AppCompatActivity() {
     @Volatile private var pendingDestLon: Double = Double.NaN
     @Volatile private var pendingDestName: String = "Destination"
     @Volatile private var cachedRouteEnvelopeJson: String? = null
-    @Volatile private var cachedMapRoadsEnvelopeJson: String? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -149,7 +146,6 @@ class CommanderActivity : AppCompatActivity() {
         setupCommanderUi()
         bluetoothAdapter = (getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
         fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
-        loadCachedRegionRoadsFromDisk()
         setupLocationCallback()
         ensureRuntimePermissionsAndStart()
         handleIncomingShareIntent(intent)
@@ -182,7 +178,7 @@ class CommanderActivity : AppCompatActivity() {
             setPadding(40, 40, 40, 40); setBackgroundColor(0xFF0F172A.toInt())
         }
         val title = TextView(this).apply { text = "Commander (Phone 1 • Pocket Mode)"; textSize = 20f; setTextColor(0xFFF8FAFC.toInt()); setPadding(0, 0, 0, 6) }
-        val subtitle = TextView(this).apply { text = "Streams GPS & Offline Road Network with Screen OFF in Pocket:"; textSize = 13f; setTextColor(0xFF94A3B8.toInt()); setPadding(0, 0, 0, 14) }
+        val subtitle = TextView(this).apply { text = "Streams 1 Hz GPS & Route with Screen OFF in Pocket:"; textSize = 13f; setTextColor(0xFF94A3B8.toInt()); setPadding(0, 0, 0, 14) }
         deviceSpinner = Spinner(this).apply { setBackgroundColor(0xFF1E293B.toInt()); setPadding(20, 16, 20, 16) }
         toggleStreamButton = Button(this).apply {
             text = "Connect & Start Pocket Streaming"; textSize = 14f; setTextColor(0xFFFFFFFF.toInt()); setBackgroundColor(0xFF2563EB.toInt()); setPadding(24, 20, 24, 20)
@@ -193,29 +189,25 @@ class CommanderActivity : AppCompatActivity() {
             setOnClickListener { requestIgnoreBatteryOptimizations() }
         }
         statusText = TextView(this).apply { text = "Status: Ready (Pocket Foreground Service Active)"; textSize = 13f; setTextColor(0xFF38BDF8.toInt()); setPadding(0, 14, 0, 6) }
-        routeStatusText = TextView(this).apply { text = "Offline Map: Share a Google Maps link OR tap 'Download Offline Region Roads' below."; textSize = 12f; setTextColor(0xFFA7F3D0.toInt()); setPadding(0, 4, 0, 10) }
+        routeStatusText = TextView(this).apply { text = "Route Hand-off: Share a place from Google Maps or paste a link/coordinates below."; textSize = 12f; setTextColor(0xFFA7F3D0.toInt()); setPadding(0, 4, 0, 10) }
         shareUrlInput = EditText(this).apply {
-            hint = "Paste Google Maps link or lat,lon (optional for Region Download)"; setHintTextColor(0xFF64748B.toInt())
+            hint = "Paste Google Maps share link or lat,lon (e.g. 12.9716,77.5946)"; setHintTextColor(0xFF64748B.toInt())
             setTextColor(0xFFF8FAFC.toInt()); setBackgroundColor(0xFF1E293B.toInt()); textSize = 13f; setPadding(20, 16, 20, 16)
         }
         sendRouteButton = Button(this).apply {
-            text = "Fetch Route + Corridor Roads & Beam"; textSize = 13f; setTextColor(0xFFFFFFFF.toInt()); setBackgroundColor(0xFF059669.toInt()); setPadding(20, 18, 20, 18)
+            text = "Fetch OSRM Route & Beam to Phone 2"; textSize = 13f; setTextColor(0xFFFFFFFF.toInt()); setBackgroundColor(0xFF059669.toInt()); setPadding(20, 18, 20, 18)
             setOnClickListener {
                 val input = shareUrlInput.text?.toString()?.trim().orEmpty()
                 if (input.isNotEmpty()) processSharedLocationText(input)
-                else Toast.makeText(this@CommanderActivity, "Paste a Google Maps link first, or use Download Offline Region Roads below.", Toast.LENGTH_SHORT).show()
+                else Toast.makeText(this@CommanderActivity, "Paste a Google Maps link or coordinates first.", Toast.LENGTH_SHORT).show()
             }
-        }
-        downloadRegionButton = Button(this).apply {
-            text = "Download Offline Region Roads (4 km Grid) & Save to Phone 2"; textSize = 13f; setTextColor(0xFFFFFFFF.toInt()); setBackgroundColor(0xFF7C3AED.toInt()); setPadding(20, 18, 20, 18)
-            setOnClickListener { downloadOfflineRegionAroundCurrentOrInput() }
         }
         telemetryText = TextView(this).apply { text = "GPS: Acquiring fix (UI updates pause automatically when screen is off)..."; textSize = 12f; setTextColor(0xFFCBD5E1.toInt()); setPadding(0, 14, 0, 0) }
         fun lp(top: Int) = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = top }
         root.addView(title); root.addView(subtitle); root.addView(deviceSpinner)
         root.addView(toggleStreamButton, lp(16)); root.addView(batteryOptButton, lp(10))
         root.addView(statusText); root.addView(routeStatusText); root.addView(shareUrlInput)
-        root.addView(sendRouteButton, lp(12)); root.addView(downloadRegionButton, lp(10)); root.addView(telemetryText)
+        root.addView(sendRouteButton, lp(12)); root.addView(telemetryText)
         scroll.addView(root); setContentView(scroll)
     }
 
@@ -280,7 +272,7 @@ class CommanderActivity : AppCompatActivity() {
                 if (!pendingDestLat.isNaN() && !pendingDestLon.isNaN()) {
                     val dLat = pendingDestLat; val dLon = pendingDestLon; val dName = pendingDestName
                     pendingDestLat = Double.NaN; pendingDestLon = Double.NaN
-                    fetchRouteAndRoadsAndTransmit(lat, lon, dLat, dLon, dName)
+                    fetchRouteAndTransmit(lat, lon, dLat, dLon, dName)
                 }
                 if (isStreaming.get()) {
                     val now = System.currentTimeMillis()
@@ -299,47 +291,6 @@ class CommanderActivity : AppCompatActivity() {
         val dLat = (lat2 - lat1) * 111320.0
         val dLon = (lon2 - lon1) * 111320.0 * cos(Math.toRadians(lat1))
         return sqrt(dLat * dLat + dLon * dLon)
-    }
-
-    private fun downloadOfflineRegionAroundCurrentOrInput() {
-        val manualText = shareUrlInput.text?.toString()?.trim().orEmpty()
-        routeExecutor.execute {
-            var cLat = latestLatitude; var cLon = latestLongitude
-            if (manualText.isNotEmpty()) {
-                resolveDestinationFromSharedText(manualText)?.let { cLat = it.first; cLon = it.second }
-            }
-            if (cLat.isNaN() || cLon.isNaN()) {
-                runOnUiThread { routeStatusText.text = "Waiting for GPS fix (or paste lat,lon in box) to download offline region roads..." }
-                tryLastLocationFallback()
-                return@execute
-            }
-            runOnUiThread { routeStatusText.text = String.format(Locale.US, "Downloading offline street network (4 km grid around %.4f, %.4f)...", cLat, cLon) }
-            val roadsJson = fetchRoadNetworkForRegion(cLat, cLon, cLat, cLon, isRegionDownload = true)
-            if (roadsJson != null) {
-                cachedMapRoadsEnvelopeJson = roadsJson
-                saveCachedRegionRoadsToDisk(roadsJson)
-                val count = JSONObject(roadsJson).optInt("roadCount", 0)
-                if (isStreaming.get()) {
-                    ioExecutor.execute { sendMapRoadsPacket(roadsJson) }
-                    runOnUiThread { routeStatusText.text = "Offline Region Downloaded ($count streets) & Beamed to Phone 2!" }
-                } else {
-                    runOnUiThread { routeStatusText.text = "Offline Region Cached ($count streets)! Connect to Phone 2 to sync." }
-                }
-            } else {
-                runOnUiThread { routeStatusText.text = "Offline Region Download failed. Check internet connection on Phone 1 and retry." }
-            }
-        }
-    }
-
-    private fun saveCachedRegionRoadsToDisk(json: String) {
-        try { File(filesDir, "commander_offline_roads.json").writeText(json, Charsets.UTF_8) } catch (_: Throwable) {}
-    }
-
-    private fun loadCachedRegionRoadsFromDisk() {
-        try {
-            val f = File(filesDir, "commander_offline_roads.json")
-            if (f.exists() && f.length() > 10) cachedMapRoadsEnvelopeJson = f.readText(Charsets.UTF_8)
-        } catch (_: Throwable) {}
     }
 
     private fun handleIncomingShareIntent(incoming: Intent?) {
@@ -368,7 +319,7 @@ class CommanderActivity : AppCompatActivity() {
                     runOnUiThread { routeStatusText.text = String.format(Locale.US, "Destination '%s' locked (%.5f, %.5f). Waiting for GPS fix...", destName, destLat, destLon) }
                     tryLastLocationFallback()
                 } else {
-                    fetchRouteAndRoadsAndTransmit(latestLatitude, latestLongitude, destLat, destLon, destName)
+                    fetchRouteAndTransmit(latestLatitude, latestLongitude, destLat, destLon, destName)
                 }
             } catch (e: Exception) {
                 runOnUiThread { routeStatusText.text = "Route Hand-off Error: ${e.message}" }
@@ -385,7 +336,7 @@ class CommanderActivity : AppCompatActivity() {
                     if (!pendingDestLat.isNaN() && !pendingDestLon.isNaN()) {
                         val dLat = pendingDestLat; val dLon = pendingDestLon; val dName = pendingDestName
                         pendingDestLat = Double.NaN; pendingDestLon = Double.NaN
-                        fetchRouteAndRoadsAndTransmit(loc.latitude, loc.longitude, dLat, dLon, dName)
+                        fetchRouteAndTransmit(loc.latitude, loc.longitude, dLat, dLon, dName)
                     }
                 }
             }
@@ -494,7 +445,7 @@ class CommanderActivity : AppCompatActivity() {
         } else null
     } catch (_: Exception) { null }
 
-    private fun fetchRouteAndRoadsAndTransmit(startLat: Double, startLon: Double, endLat: Double, endLon: Double, destinationName: String) {
+    private fun fetchRouteAndTransmit(startLat: Double, startLon: Double, endLat: Double, endLon: Double, destinationName: String) {
         runOnUiThread { routeStatusText.text = String.format(Locale.US, "Fetching OSRM route to %s...", destinationName) }
         routeExecutor.execute {
             try {
@@ -560,95 +511,14 @@ class CommanderActivity : AppCompatActivity() {
                 val distKm = totalDist / 1000.0; val durMin = (totalDur / 60.0).toInt().coerceAtLeast(1)
                 if (isStreaming.get()) {
                     ioExecutor.execute { sendRouteDataPacket(envelopeStr) }
-                    runOnUiThread { routeStatusText.text = String.format(Locale.US, "Route Beamed! (%s • %.1f km • ~%d min). Downloading street grid...", resolvedName, distKm, durMin) }
+                    runOnUiThread { routeStatusText.text = String.format(Locale.US, "Route Beamed to Phone 2! (%s • %.1f km • ~%d min)", resolvedName, distKm, durMin) }
                 } else {
-                    runOnUiThread { routeStatusText.text = String.format(Locale.US, "Route Ready (%s • %.1f km • ~%d min). Downloading street grid...", resolvedName, distKm, durMin) }
-                }
-                fetchRoadNetworkForRegion(startLat, startLon, endLat, endLon, isRegionDownload = false, routePoints = anchored)?.let { roadsStr ->
-                    cachedMapRoadsEnvelopeJson = roadsStr
-                    saveCachedRegionRoadsToDisk(roadsStr)
-                    val count = JSONObject(roadsStr).optInt("roadCount", 0)
-                    if (isStreaming.get()) {
-                        ioExecutor.execute { sendMapRoadsPacket(roadsStr) }
-                        runOnUiThread { routeStatusText.text = String.format(Locale.US, "Route + %d Actual Streets Beamed & Saved to Phone 2!", count) }
-                    } else {
-                        runOnUiThread { routeStatusText.text = String.format(Locale.US, "Route + %d Streets Ready (Connect Phone 2 to sync).", count) }
-                    }
+                    runOnUiThread { routeStatusText.text = String.format(Locale.US, "Route Ready (%s • %.1f km • ~%d min). Connect Phone 2 to beam.", resolvedName, distKm, durMin) }
                 }
             } catch (e: Exception) {
                 runOnUiThread { routeStatusText.text = "OSRM Error: ${e.message}" }
             }
         }
-    }
-
-    private fun fetchRoadNetworkForRegion(startLat: Double, startLon: Double, endLat: Double, endLon: Double, isRegionDownload: Boolean, routePoints: JSONArray? = null): String? {
-        val hwFilter = "motorway|trunk|primary|secondary|tertiary|unclassified|residential|living_street|service"
-        val query = if (isRegionDownload || routePoints == null || routePoints.length() < 2) {
-            val d = 0.018
-            String.format(Locale.US, "[out:json][timeout:18];way[\"highway\"~\"^($hwFilter)$\"](%.5f,%.5f,%.5f,%.5f);out geom;", startLat - d, startLon - d, startLat + d, startLon + d)
-        } else {
-            val sb = StringBuilder()
-            val n = routePoints.length()
-            val step = max(1, n / 16)
-            var idx = 0
-            while (idx < n) {
-                val pt = routePoints.optJSONArray(idx)
-                if (pt != null && pt.length() >= 2) {
-                    if (sb.isNotEmpty()) sb.append(",")
-                    sb.append(String.format(Locale.US, "%.5f,%.5f", pt.optDouble(1), pt.optDouble(0)))
-                }
-                idx += step
-            }
-            val lastPt = routePoints.optJSONArray(n - 1)
-            if (lastPt != null && lastPt.length() >= 2) sb.append(String.format(Locale.US, ",%.5f,%.5f", lastPt.optDouble(1), lastPt.optDouble(0)))
-            String.format(Locale.US, "[out:json][timeout:18];(way[\"highway\"~\"^($hwFilter)$\"](around:380,%s);way[\"highway\"~\"^($hwFilter)$\"](around:1200,%.5f,%.5f););out geom;", sb.toString(), startLat, startLon)
-        }
-
-        val scheme = "https"
-        val endpoints = listOf("$scheme://overpass-api.de/api/interpreter", "$scheme://overpass.kumi.systems/api/interpreter", "$scheme://maps.mail.ru/osm/tools/overpass/api/interpreter")
-        var body = ""
-        for (ep in endpoints) {
-            try {
-                val urlWithQuery = "$ep?data=" + URLEncoder.encode(query, "UTF-8")
-                val conn = (URL(urlWithQuery).openConnection() as HttpURLConnection).apply {
-                    connectTimeout = 12000; readTimeout = 18000; requestMethod = "GET"
-                    setRequestProperty("User-Agent", "PocketNavAndroid/1.0")
-                }
-                if (conn.responseCode in 200..299) {
-                    body = readStreamSnippet(conn, 1_800_000); conn.disconnect()
-                    if (body.contains("\"elements\"")) break
-                } else conn.disconnect()
-            } catch (_: Exception) {}
-        }
-        if (body.isEmpty()) return null
-        return try {
-            val elements = JSONObject(body).optJSONArray("elements") ?: return null
-            val majorF = JSONArray(); val minorF = JSONArray()
-            val majorSet = setOf("motorway", "trunk", "primary", "secondary", "tertiary")
-            val limit = min(elements.length(), 4500)
-            for (i in 0 until limit) {
-                val el = elements.getJSONObject(i)
-                val geom = el.optJSONArray("geometry") ?: continue
-                if (geom.length() < 2) continue
-                val hw = el.optJSONObject("tags")?.optString("highway", "residential") ?: "residential"
-                val coords = JSONArray()
-                for (j in 0 until geom.length()) {
-                    val pt = geom.getJSONObject(j)
-                    val lon = (pt.optDouble("lon") * 100000.0).roundToInt() / 100000.0
-                    val lat = (pt.optDouble("lat") * 100000.0).roundToInt() / 100000.0
-                    coords.put(JSONArray().put(lon).put(lat))
-                }
-                val feat = JSONObject().put("type", "Feature").put("properties", JSONObject()).put("geometry", JSONObject().put("type", "LineString").put("coordinates", coords))
-                if (majorSet.contains(hw)) majorF.put(feat) else minorF.put(feat)
-            }
-            val totalWays = majorF.length() + minorF.length()
-            if (totalWays == 0) return null
-            JSONObject()
-                .put("majorRoadsGeoJson", JSONObject().put("type", "FeatureCollection").put("features", majorF).toString())
-                .put("minorRoadsGeoJson", JSONObject().put("type", "FeatureCollection").put("features", minorF).toString())
-                .put("roadCount", totalWays)
-                .toString()
-        } catch (_: Exception) { null }
     }
 
     private fun readStreamSnippet(conn: HttpURLConnection, maxChars: Int): String {
@@ -696,7 +566,6 @@ class CommanderActivity : AppCompatActivity() {
                     statusText.text = "Status: Connected & Pocket Streaming to ${dev.name} (Safe to lock screen)"
                     toggleStreamButton.text = "Stop Streaming"; toggleStreamButton.setBackgroundColor(0xFFDC2626.toInt()); toggleStreamButton.isEnabled = true
                 }
-                cachedMapRoadsEnvelopeJson?.let { sendMapRoadsPacket(it) }
                 cachedRouteEnvelopeJson?.let { sendRouteDataPacket(it) }
             } catch (e: Throwable) {
                 closeSocketQuietly()
@@ -716,11 +585,6 @@ class CommanderActivity : AppCompatActivity() {
     @Synchronized private fun sendRouteDataPacket(json: String) {
         val out = dataOutputStream ?: return
         try { TelemetryProtocol.writeRouteDataPacket(out, json) } catch (e: IOException) { stopStreamingOnDisconnect(e.message) }
-    }
-
-    @Synchronized private fun sendMapRoadsPacket(json: String) {
-        val out = dataOutputStream ?: return
-        try { TelemetryProtocol.writeMapRoadsPacket(out, json) } catch (e: IOException) { stopStreamingOnDisconnect(e.message) }
     }
 
     private fun stopStreamingOnDisconnect(reason: String?) {
