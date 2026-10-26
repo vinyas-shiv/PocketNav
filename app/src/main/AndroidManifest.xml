@@ -2,8 +2,17 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
+    <!-- Internet permission for Phone 1 (Commander) to unshorten Google Maps links, query OSRM & download Overpass offline roads -->
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- WakeLock & Foreground Service permissions so Phone 1 streams GPS continuously with screen OFF in pocket -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <!-- Legacy Bluetooth permissions for Android 11 (API 30) and lower -->
     <uses-permission
         android:name="android.permission.BLUETOOTH"
         android:maxSdkVersion="30" />
@@ -11,6 +20,7 @@
         android:name="android.permission.BLUETOOTH_ADMIN"
         android:maxSdkVersion="30" />
 
+    <!-- Android 12+ (API 31+) runtime Bluetooth permissions for RFCOMM streaming & listening -->
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <uses-permission
         android:name="android.permission.BLUETOOTH_SCAN"
@@ -18,9 +28,12 @@
         tools:targetApi="s" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
 
+    <!-- High-accuracy GPS permissions (Used by Phone 1 Commander) -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
 
+    <!-- Optional hardware features so Phone 2 (with GPS off/absent) can still install & run -->
     <uses-feature
         android:name="android.hardware.bluetooth"
         android:required="true" />
@@ -35,6 +48,7 @@
         android:usesCleartextTraffic="true"
         android:theme="@style/Theme.MaterialComponents.DayNight.NoActionBar">
 
+        <!-- Role Selector Launcher Activity -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -45,6 +59,7 @@
             </intent-filter>
         </activity>
 
+        <!-- Phone 1: Commander Activity (Receives Shared Google Maps Links via ACTION_SEND) -->
         <activity
             android:name=".CommanderActivity"
             android:exported="true"
@@ -58,6 +73,14 @@
             </intent-filter>
         </activity>
 
+        <!-- Foreground Service keeping GPS & Bluetooth RFCOMM active when Phone 1 screen is OFF in pocket -->
+        <service
+            android:name=".CommanderForegroundService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="location" />
+
+        <!-- Phone 2: Offline 3D MapLibre Dashboard Activity -->
         <activity
             android:name=".DashboardActivity"
             android:exported="false"
