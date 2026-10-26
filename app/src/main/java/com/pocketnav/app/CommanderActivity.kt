@@ -2,6 +2,11 @@ package com.pocketnav.app
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
@@ -9,28 +14,26 @@ import android.bluetooth.BluetoothSocket
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
+import android.provider.Settings
 import android.view.Gravity
-import android.view.WindowManager
-import android.widget.ArrayAdapter
-import android.widget.Button
-import android.widget.EditText
-import android.widget.LinearLayout
-import android.widget.ScrollView
-import android.widget.Spinner
-import android.widget.TextView
-import android.widget.Toast
+import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
+import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.google.android.gms.location.*
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.DataOutputStream
+import java.io.File
 import java.io.IOException
 import java.io.InputStreamReader
 import java.net.HttpURLConnection
@@ -41,8 +44,67 @@ import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.regex.Pattern
-import kotlin.math.max
-import kotlin.math.min
+import kotlin.math.*
+
+class CommanderForegroundService : Service() {
+    private var wakeLock: PowerManager.WakeLock? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        startPocketNotification()
+        acquireCpuWakeLock()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        startPocketNotification()
+        return START_STICKY
+    }
+
+    private fun startPocketNotification() {
+        val channelId = "pocketnav_commander_channel"
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(channelId, "PocketNav Pocket Telemetry", NotificationManager.IMPORTANCE_LOW).apply {
+                description = "Keeps GPS and Bluetooth streaming active while phone is locked in pocket"
+                setShowBadge(false)
+            }
+            nm.createNotificationChannel(channel)
+        }
+        val pi = PendingIntent.getActivity(this, 0, Intent(this, CommanderActivity::class.java), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        val notif: Notification = NotificationCompat.Builder(this, channelId)
+            .setContentTitle("PocketNav Commander (Pocket Mode)")
+            .setContentText("Streaming low-power GPS & road telemetry to Dashboard")
+            .setSmallIcon(android.R.drawable.ic_menu_mylocation)
+            .setContentIntent(pi)
+            .setOngoing(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(1001, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
+            } else {
+                startForeground(1001, notif)
+            }
+        } catch (_: Throwable) {}
+    }
+
+    private fun acquireCpuWakeLock() {
+        try {
+            val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PocketNav::PocketGpsLock").apply {
+                setReferenceCounted(false)
+                acquire(12 * 60 * 60 * 1000L)
+            }
+        } catch (_: Throwable) {}
+    }
+
+    override fun onDestroy() {
+        try { wakeLock?.let { if (it.isHeld) it.release() } } catch (_: Throwable) {}
+        super.onDestroy()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+}
 
 class CommanderActivity : AppCompatActivity() {
     private lateinit var fusedLocationClient: FusedLocationProviderClient
@@ -52,6 +114,7 @@ class CommanderActivity : AppCompatActivity() {
     private var rfcommSocket: BluetoothSocket? = null
     private var dataOutputStream: DataOutputStream? = null
     private val isStreaming = AtomicBoolean(false)
+    private val isUiVisible = AtomicBoolean(true)
     private val ioExecutor = Executors.newSingleThreadExecutor()
     private val routeExecutor = Executors.newSingleThreadExecutor()
 
@@ -61,11 +124,18 @@ class CommanderActivity : AppCompatActivity() {
     private lateinit var routeStatusText: TextView
     private lateinit var shareUrlInput: EditText
     private lateinit var sendRouteButton: Button
+    private lateinit var downloadRegionButton: Button
+    private lateinit var batteryOptButton: Button
     private lateinit var toggleStreamButton: Button
     private val pairedDevicesList = mutableListOf<BluetoothDevice>()
 
     @Volatile private var latestLatitude: Double = Double.NaN
     @Volatile private var latestLongitude: Double = Double.NaN
+    @Volatile private var lastSentLat: Double = Double.NaN
+    @Volatile private var lastSentLon: Double = Double.NaN
+    @Volatile private var lastSentBearing: Float = 0f
+    @Volatile private var lastSentTimeMs: Long = 0L
+
     @Volatile private var pendingDestLat: Double = Double.NaN
     @Volatile private var pendingDestLon: Double = Double.NaN
     @Volatile private var pendingDestName: String = "Destination"
@@ -74,15 +144,19 @@ class CommanderActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         acquireWakeLockSafely()
+        startPocketForegroundService()
         setupCommanderUi()
         bluetoothAdapter = (getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
         fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
+        loadCachedRegionRoadsFromDisk()
         setupLocationCallback()
         ensureRuntimePermissionsAndStart()
         handleIncomingShareIntent(intent)
     }
+
+    override fun onResume() { super.onResume(); isUiVisible.set(true) }
+    override fun onPause() { super.onPause(); isUiVisible.set(false) }
 
     override fun onNewIntent(intent: Intent?) {
         super.onNewIntent(intent)
@@ -90,133 +164,102 @@ class CommanderActivity : AppCompatActivity() {
         handleIncomingShareIntent(intent)
     }
 
+    private fun startPocketForegroundService() {
+        try {
+            val svc = Intent(this, CommanderForegroundService::class.java)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(svc) else startService(svc)
+        } catch (_: Throwable) {}
+    }
+
+    private fun stopPocketForegroundService() {
+        try { stopService(Intent(this, CommanderForegroundService::class.java)) } catch (_: Throwable) {}
+    }
+
     private fun setupCommanderUi() {
-        val scroll = ScrollView(this).apply {
-            setBackgroundColor(0xFF0F172A.toInt())
-            isFillViewport = true
-        }
+        val scroll = ScrollView(this).apply { setBackgroundColor(0xFF0F172A.toInt()); isFillViewport = true }
         val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(48, 48, 48, 48)
-            setBackgroundColor(0xFF0F172A.toInt())
+            orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(40, 40, 40, 40); setBackgroundColor(0xFF0F172A.toInt())
         }
-        val title = TextView(this).apply {
-            text = "Commander (Phone 1)"
-            textSize = 22f
-            setTextColor(0xFFF8FAFC.toInt())
-            setPadding(0, 0, 0, 8)
-        }
-        val subtitle = TextView(this).apply {
-            text = "Select paired Dashboard (Phone 2) for 1 Hz GPS + Route + Roads:"
-            textSize = 14f
-            setTextColor(0xFF94A3B8.toInt())
-            setPadding(0, 0, 0, 16)
-        }
-        deviceSpinner = Spinner(this).apply {
-            setBackgroundColor(0xFF1E293B.toInt())
-            setPadding(24, 20, 24, 20)
-        }
+        val title = TextView(this).apply { text = "Commander (Phone 1 • Pocket Mode)"; textSize = 20f; setTextColor(0xFFF8FAFC.toInt()); setPadding(0, 0, 0, 6) }
+        val subtitle = TextView(this).apply { text = "Streams GPS & Offline Road Network with Screen OFF in Pocket:"; textSize = 13f; setTextColor(0xFF94A3B8.toInt()); setPadding(0, 0, 0, 14) }
+        deviceSpinner = Spinner(this).apply { setBackgroundColor(0xFF1E293B.toInt()); setPadding(20, 16, 20, 16) }
         toggleStreamButton = Button(this).apply {
-            text = "Connect & Start Streaming"
-            textSize = 15f
-            setTextColor(0xFFFFFFFF.toInt())
-            setBackgroundColor(0xFF2563EB.toInt())
-            setPadding(32, 24, 32, 24)
+            text = "Connect & Start Pocket Streaming"; textSize = 14f; setTextColor(0xFFFFFFFF.toInt()); setBackgroundColor(0xFF2563EB.toInt()); setPadding(24, 20, 24, 20)
             setOnClickListener { if (isStreaming.get()) stopStreaming() else startStreamingToSelectedDevice() }
         }
-        statusText = TextView(this).apply {
-            text = "Status: Waiting for connection..."
-            textSize = 14f
-            setTextColor(0xFF38BDF8.toInt())
-            setPadding(0, 20, 0, 8)
+        batteryOptButton = Button(this).apply {
+            text = "Enable Unrestricted Pocket Battery Mode"; textSize = 12f; setTextColor(0xFFFDE047.toInt()); setBackgroundColor(0xFF1E293B.toInt()); setPadding(20, 14, 20, 14)
+            setOnClickListener { requestIgnoreBatteryOptimizations() }
         }
-        routeStatusText = TextView(this).apply {
-            text = "Route Hand-off: Share a place from Google Maps or paste a link/coordinates below."
-            textSize = 13f
-            setTextColor(0xFFA7F3D0.toInt())
-            setPadding(0, 8, 0, 12)
-        }
+        statusText = TextView(this).apply { text = "Status: Ready (Pocket Foreground Service Active)"; textSize = 13f; setTextColor(0xFF38BDF8.toInt()); setPadding(0, 14, 0, 6) }
+        routeStatusText = TextView(this).apply { text = "Offline Map: Share a Google Maps link OR tap 'Download Offline Region Roads' below."; textSize = 12f; setTextColor(0xFFA7F3D0.toInt()); setPadding(0, 4, 0, 10) }
         shareUrlInput = EditText(this).apply {
-            hint = "Paste Google Maps share link or lat,lon (e.g. 12.9716,77.5946)"
-            setHintTextColor(0xFF64748B.toInt())
-            setTextColor(0xFFF8FAFC.toInt())
-            setBackgroundColor(0xFF1E293B.toInt())
-            textSize = 13f
-            setPadding(24, 20, 24, 20)
+            hint = "Paste Google Maps link or lat,lon (optional for Region Download)"; setHintTextColor(0xFF64748B.toInt())
+            setTextColor(0xFFF8FAFC.toInt()); setBackgroundColor(0xFF1E293B.toInt()); textSize = 13f; setPadding(20, 16, 20, 16)
         }
         sendRouteButton = Button(this).apply {
-            text = "Fetch Route + Roads & Beam to Phone 2"
-            textSize = 14f
-            setTextColor(0xFFFFFFFF.toInt())
-            setBackgroundColor(0xFF059669.toInt())
-            setPadding(24, 20, 24, 20)
+            text = "Fetch Route + Corridor Roads & Beam"; textSize = 13f; setTextColor(0xFFFFFFFF.toInt()); setBackgroundColor(0xFF059669.toInt()); setPadding(20, 18, 20, 18)
             setOnClickListener {
                 val input = shareUrlInput.text?.toString()?.trim().orEmpty()
                 if (input.isNotEmpty()) processSharedLocationText(input)
-                else Toast.makeText(this@CommanderActivity, "Paste a link or coordinates first.", Toast.LENGTH_SHORT).show()
+                else Toast.makeText(this@CommanderActivity, "Paste a Google Maps link first, or use Download Offline Region Roads below.", Toast.LENGTH_SHORT).show()
             }
         }
-        telemetryText = TextView(this).apply {
-            text = "GPS: Acquiring high-accuracy fix..."
-            textSize = 13f
-            setTextColor(0xFFCBD5E1.toInt())
-            setPadding(0, 16, 0, 0)
+        downloadRegionButton = Button(this).apply {
+            text = "Download Offline Region Roads (4 km Grid) & Save to Phone 2"; textSize = 13f; setTextColor(0xFFFFFFFF.toInt()); setBackgroundColor(0xFF7C3AED.toInt()); setPadding(20, 18, 20, 18)
+            setOnClickListener { downloadOfflineRegionAroundCurrentOrInput() }
         }
-        val lpToggle = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = 20 }
-        val lpSend = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = 20 }
-        root.addView(title)
-        root.addView(subtitle)
-        root.addView(deviceSpinner)
-        root.addView(toggleStreamButton, lpToggle)
-        root.addView(statusText)
-        root.addView(routeStatusText)
-        root.addView(shareUrlInput)
-        root.addView(sendRouteButton, lpSend)
-        root.addView(telemetryText)
-        scroll.addView(root)
-        setContentView(scroll)
+        telemetryText = TextView(this).apply { text = "GPS: Acquiring fix (UI updates pause automatically when screen is off)..."; textSize = 12f; setTextColor(0xFFCBD5E1.toInt()); setPadding(0, 14, 0, 0) }
+        fun lp(top: Int) = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = top }
+        root.addView(title); root.addView(subtitle); root.addView(deviceSpinner)
+        root.addView(toggleStreamButton, lp(16)); root.addView(batteryOptButton, lp(10))
+        root.addView(statusText); root.addView(routeStatusText); root.addView(shareUrlInput)
+        root.addView(sendRouteButton, lp(12)); root.addView(downloadRegionButton, lp(10)); root.addView(telemetryText)
+        scroll.addView(root); setContentView(scroll)
+    }
+
+    @SuppressLint("BatteryLife")
+    private fun requestIgnoreBatteryOptimizations() {
+        try {
+            val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && pm != null && !pm.isIgnoringBatteryOptimizations(packageName)) {
+                startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply { data = Uri.parse("package:$packageName") })
+            } else {
+                Toast.makeText(this, "PocketNav is already unrestricted for pocket background use!", Toast.LENGTH_SHORT).show()
+            }
+        } catch (_: Throwable) {
+            Toast.makeText(this, "Battery optimization exemption granted or managed by system.", Toast.LENGTH_SHORT).show()
+        }
     }
 
     private fun ensureRuntimePermissionsAndStart() {
         val needed = mutableListOf<String>()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
-                needed.add(Manifest.permission.BLUETOOTH_CONNECT)
-            }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+            needed.add(Manifest.permission.BLUETOOTH_CONNECT)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            needed.add(Manifest.permission.POST_NOTIFICATIONS)
         }
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED &&
-            ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED
-        ) {
-            needed.add(Manifest.permission.ACCESS_FINE_LOCATION)
-            needed.add(Manifest.permission.ACCESS_COARSE_LOCATION)
+            ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            needed.add(Manifest.permission.ACCESS_FINE_LOCATION); needed.add(Manifest.permission.ACCESS_COARSE_LOCATION)
         }
-        if (needed.isNotEmpty()) {
-            ActivityCompat.requestPermissions(this, needed.toTypedArray(), 201)
-        }
-        populatePairedDevices()
-        startHighAccuracyLocationUpdates()
+        if (needed.isNotEmpty()) ActivityCompat.requestPermissions(this, needed.toTypedArray(), 201)
+        populatePairedDevices(); startHighAccuracyLocationUpdates()
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        populatePairedDevices()
-        startHighAccuracyLocationUpdates()
+        populatePairedDevices(); startHighAccuracyLocationUpdates()
     }
 
     @SuppressLint("MissingPermission")
     private fun populatePairedDevices() {
         pairedDevicesList.clear()
-        val bonded = try {
-            bluetoothAdapter?.bondedDevices ?: emptySet()
-        } catch (_: SecurityException) {
-            emptySet()
-        } catch (_: Throwable) {
-            emptySet()
-        }
+        val bonded = try { bluetoothAdapter?.bondedDevices ?: emptySet() } catch (_: Throwable) { emptySet() }
         pairedDevicesList.addAll(bonded)
-        val names = if (pairedDevicesList.isEmpty()) listOf("No paired Bluetooth devices found")
-        else pairedDevicesList.map { "${it.name ?: "Unknown"} (${it.address})" }
+        val names = if (pairedDevicesList.isEmpty()) listOf("No paired Bluetooth devices found") else pairedDevicesList.map { "${it.name ?: "Unknown"} (${it.address})" }
         deviceSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, names)
     }
 
@@ -224,22 +267,79 @@ class CommanderActivity : AppCompatActivity() {
         locationCallback = object : LocationCallback() {
             override fun onLocationResult(result: LocationResult) {
                 val loc = result.lastLocation ?: return
-                val lat = loc.latitude
-                val lon = loc.longitude
-                val bearing = if (loc.hasBearing()) loc.bearing else 0.0f
+                val lat = loc.latitude; val lon = loc.longitude
+                val bearing = if (loc.hasBearing()) loc.bearing else lastSentBearing
                 val speed = if (loc.hasSpeed()) loc.speed else 0.0f
                 latestLatitude = lat; latestLongitude = lon
-                runOnUiThread {
-                    telemetryText.text = String.format(Locale.US, "GPS Fix:\nLat: %.6f\nLon: %.6f\nBearing: %.1f°\nSpeed: %.1f km/h", lat, lon, bearing, speed * 3.6f)
+
+                if (isUiVisible.get()) {
+                    runOnUiThread {
+                        telemetryText.text = String.format(Locale.US, "GPS Fix (Pocket Service Active):\nLat: %.6f | Lon: %.6f\nBearing: %.1f° | Speed: %.1f km/h", lat, lon, bearing, speed * 3.6f)
+                    }
                 }
                 if (!pendingDestLat.isNaN() && !pendingDestLon.isNaN()) {
                     val dLat = pendingDestLat; val dLon = pendingDestLon; val dName = pendingDestName
                     pendingDestLat = Double.NaN; pendingDestLon = Double.NaN
                     fetchRouteAndRoadsAndTransmit(lat, lon, dLat, dLon, dName)
                 }
-                if (isStreaming.get()) ioExecutor.execute { sendLocationPacket(lat, lon, bearing, speed) }
+                if (isStreaming.get()) {
+                    val now = System.currentTimeMillis()
+                    val moved = if (lastSentLat.isNaN()) 999.0 else quickDistMeters(lat, lon, lastSentLat, lastSentLon)
+                    val bDelta = abs(bearing - lastSentBearing)
+                    if (speed >= 0.45f || moved >= 1.2 || bDelta >= 3.5f || (now - lastSentTimeMs) >= 3000L) {
+                        lastSentLat = lat; lastSentLon = lon; lastSentBearing = bearing; lastSentTimeMs = now
+                        ioExecutor.execute { sendLocationPacket(lat, lon, bearing, speed) }
+                    }
+                }
             }
         }
+    }
+
+    private fun quickDistMeters(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
+        val dLat = (lat2 - lat1) * 111320.0
+        val dLon = (lon2 - lon1) * 111320.0 * cos(Math.toRadians(lat1))
+        return sqrt(dLat * dLat + dLon * dLon)
+    }
+
+    private fun downloadOfflineRegionAroundCurrentOrInput() {
+        val manualText = shareUrlInput.text?.toString()?.trim().orEmpty()
+        routeExecutor.execute {
+            var cLat = latestLatitude; var cLon = latestLongitude
+            if (manualText.isNotEmpty()) {
+                resolveDestinationFromSharedText(manualText)?.let { cLat = it.first; cLon = it.second }
+            }
+            if (cLat.isNaN() || cLon.isNaN()) {
+                runOnUiThread { routeStatusText.text = "Waiting for GPS fix (or paste lat,lon in box) to download offline region roads..." }
+                tryLastLocationFallback()
+                return@execute
+            }
+            runOnUiThread { routeStatusText.text = String.format(Locale.US, "Downloading offline street network (4 km grid around %.4f, %.4f)...", cLat, cLon) }
+            val roadsJson = fetchRoadNetworkForRegion(cLat, cLon, cLat, cLon, isRegionDownload = true)
+            if (roadsJson != null) {
+                cachedMapRoadsEnvelopeJson = roadsJson
+                saveCachedRegionRoadsToDisk(roadsJson)
+                val count = JSONObject(roadsJson).optInt("roadCount", 0)
+                if (isStreaming.get()) {
+                    ioExecutor.execute { sendMapRoadsPacket(roadsJson) }
+                    runOnUiThread { routeStatusText.text = "Offline Region Downloaded ($count streets) & Beamed to Phone 2!" }
+                } else {
+                    runOnUiThread { routeStatusText.text = "Offline Region Cached ($count streets)! Connect to Phone 2 to sync." }
+                }
+            } else {
+                runOnUiThread { routeStatusText.text = "Offline Region Download failed. Check internet connection on Phone 1 and retry." }
+            }
+        }
+    }
+
+    private fun saveCachedRegionRoadsToDisk(json: String) {
+        try { File(filesDir, "commander_offline_roads.json").writeText(json, Charsets.UTF_8) } catch (_: Throwable) {}
+    }
+
+    private fun loadCachedRegionRoadsFromDisk() {
+        try {
+            val f = File(filesDir, "commander_offline_roads.json")
+            if (f.exists() && f.length() > 10) cachedMapRoadsEnvelopeJson = f.readText(Charsets.UTF_8)
+        } catch (_: Throwable) {}
     }
 
     private fun handleIncomingShareIntent(incoming: Intent?) {
@@ -299,8 +399,7 @@ class CommanderActivity : AppCompatActivity() {
         val m = Pattern.compile(urlRegex).matcher(sharedText)
         if (!m.find()) return null
         var currentUrl = m.group(1) ?: return null
-        var redirects = 0
-        var htmlBody = ""
+        var redirects = 0; var htmlBody = ""
         while (redirects < 10) {
             extractPlaceNameFromUrl(currentUrl)?.let { if (it.isNotEmpty()) label = it }
             extractLatLonFromString(currentUrl)?.let { return Triple(it.first, it.second, label.ifEmpty { "Destination" }) }
@@ -312,15 +411,13 @@ class CommanderActivity : AppCompatActivity() {
             if (code in 300..399) {
                 val locHeader = conn.getHeaderField("Location") ?: break
                 currentUrl = URL(URL(currentUrl), locHeader).toString()
-                conn.disconnect()
-                redirects++
+                conn.disconnect(); redirects++
             } else {
                 val finalUrl = conn.url?.toString() ?: currentUrl
                 extractPlaceNameFromUrl(finalUrl)?.let { if (it.isNotEmpty()) label = it }
                 extractLatLonFromString(finalUrl)?.let { conn.disconnect(); return Triple(it.first, it.second, label.ifEmpty { "Destination" }) }
                 htmlBody = readStreamSnippet(conn, 120_000)
-                conn.disconnect()
-                break
+                conn.disconnect(); break
             }
         }
         if (htmlBody.isNotEmpty()) {
@@ -365,8 +462,7 @@ class CommanderActivity : AppCompatActivity() {
         for (p in patterns) {
             val m = Pattern.compile(p).matcher(decoded)
             if (m.find()) {
-                val lat = m.group(1)?.toDoubleOrNull()
-                val lon = m.group(2)?.toDoubleOrNull()
+                val lat = m.group(1)?.toDoubleOrNull(); val lon = m.group(2)?.toDoubleOrNull()
                 if (lat != null && lon != null && lat in -90.0..90.0 && lon in -180.0..180.0 && !(lat == 0.0 && lon == 0.0)) return Pair(lat, lon)
             }
         }
@@ -419,15 +515,7 @@ class CommanderActivity : AppCompatActivity() {
                 val totalDur = firstRoute.optDouble("duration", 0.0)
                 val rawCoords = firstRoute.getJSONObject("geometry").optJSONArray("coordinates") ?: JSONArray()
                 val anchored = JSONArray().put(JSONArray().put(startLon).put(startLat))
-                var minLat = min(startLat, endLat); var maxLat = max(startLat, endLat)
-                var minLon = min(startLon, endLon); var maxLon = max(startLon, endLon)
-                for (i in 0 until rawCoords.length()) {
-                    val pt = rawCoords.getJSONArray(i)
-                    anchored.put(pt)
-                    val lon = pt.optDouble(0, startLon); val lat = pt.optDouble(1, startLat)
-                    if (lat < minLat) minLat = lat; if (lat > maxLat) maxLat = lat
-                    if (lon < minLon) minLon = lon; if (lon > maxLon) maxLon = lon
-                }
+                for (i in 0 until rawCoords.length()) anchored.put(rawCoords.getJSONArray(i))
                 val routeFc = JSONObject().put("type", "FeatureCollection").put("features", JSONArray().put(
                     JSONObject().put("type", "Feature").put("properties", JSONObject()).put("geometry", JSONObject().put("type", "LineString").put("coordinates", anchored))
                 ))
@@ -464,27 +552,27 @@ class CommanderActivity : AppCompatActivity() {
                     JSONObject().put("type", "Feature").put("properties", JSONObject().put("title", resolvedName)).put("geometry", JSONObject().put("type", "Point").put("coordinates", JSONArray().put(endLon).put(endLat)))
                 ))
                 val envelopeStr = JSONObject().apply {
-                    put("routeGeoJson", routeFc.toString())
-                    put("turnsGeoJson", turnsFc.toString())
-                    put("destGeoJson", destFc.toString())
-                    put("destinationName", resolvedName)
-                    put("destLat", endLat); put("destLon", endLon)
-                    put("totalDistanceMeters", totalDist); put("totalDurationSeconds", totalDur)
-                    put("steps", stepsArr)
+                    put("routeGeoJson", routeFc.toString()); put("turnsGeoJson", turnsFc.toString()); put("destGeoJson", destFc.toString())
+                    put("destinationName", resolvedName); put("destLat", endLat); put("destLon", endLon)
+                    put("totalDistanceMeters", totalDist); put("totalDurationSeconds", totalDur); put("steps", stepsArr)
                 }.toString()
                 cachedRouteEnvelopeJson = envelopeStr
                 val distKm = totalDist / 1000.0; val durMin = (totalDur / 60.0).toInt().coerceAtLeast(1)
                 if (isStreaming.get()) {
                     ioExecutor.execute { sendRouteDataPacket(envelopeStr) }
-                    runOnUiThread { routeStatusText.text = String.format(Locale.US, "Route Beamed! (%s • %.1f km • ~%d min). Fetching roads...", resolvedName, distKm, durMin) }
+                    runOnUiThread { routeStatusText.text = String.format(Locale.US, "Route Beamed! (%s • %.1f km • ~%d min). Downloading street grid...", resolvedName, distKm, durMin) }
                 } else {
-                    runOnUiThread { routeStatusText.text = String.format(Locale.US, "Route Ready (%s • %.1f km • ~%d min).", resolvedName, distKm, durMin) }
+                    runOnUiThread { routeStatusText.text = String.format(Locale.US, "Route Ready (%s • %.1f km • ~%d min). Downloading street grid...", resolvedName, distKm, durMin) }
                 }
-                fetchSurroundingRoadsEnvelope(startLat, startLon, minLat, minLon, maxLat, maxLon)?.let { roadsStr ->
+                fetchRoadNetworkForRegion(startLat, startLon, endLat, endLon, isRegionDownload = false, routePoints = anchored)?.let { roadsStr ->
                     cachedMapRoadsEnvelopeJson = roadsStr
+                    saveCachedRegionRoadsToDisk(roadsStr)
+                    val count = JSONObject(roadsStr).optInt("roadCount", 0)
                     if (isStreaming.get()) {
                         ioExecutor.execute { sendMapRoadsPacket(roadsStr) }
-                        runOnUiThread { routeStatusText.text = String.format(Locale.US, "Route + Actual Roads Beamed! (%s • %.1f km • ~%d min)", resolvedName, distKm, durMin) }
+                        runOnUiThread { routeStatusText.text = String.format(Locale.US, "Route + %d Actual Streets Beamed & Saved to Phone 2!", count) }
+                    } else {
+                        runOnUiThread { routeStatusText.text = String.format(Locale.US, "Route + %d Streets Ready (Connect Phone 2 to sync).", count) }
                     }
                 }
             } catch (e: Exception) {
@@ -493,27 +581,42 @@ class CommanderActivity : AppCompatActivity() {
         }
     }
 
-    private fun fetchSurroundingRoadsEnvelope(startLat: Double, startLon: Double, rawMinLat: Double, rawMinLon: Double, rawMaxLat: Double, rawMaxLon: Double): String? {
-        val pad = 0.0045
-        var south = rawMinLat - pad; var north = rawMaxLat + pad
-        var west = rawMinLon - pad; var east = rawMaxLon + pad
-        val maxSpan = 0.075
-        if (north - south > maxSpan) { south = min(startLat, rawMaxLat) - pad; north = south + maxSpan }
-        if (east - west > maxSpan) { west = min(startLon, rawMaxLon) - pad; east = west + maxSpan }
-        val q = String.format(Locale.US, "[out:json][timeout:12];way[\"highway\"~\"^(motorway|trunk|primary|secondary|tertiary|unclassified|residential|living_street)$\"](%.5f,%.5f,%.5f,%.5f);out geom;", south, west, north, east)
+    private fun fetchRoadNetworkForRegion(startLat: Double, startLon: Double, endLat: Double, endLon: Double, isRegionDownload: Boolean, routePoints: JSONArray? = null): String? {
+        val hwFilter = "motorway|trunk|primary|secondary|tertiary|unclassified|residential|living_street|service"
+        val query = if (isRegionDownload || routePoints == null || routePoints.length() < 2) {
+            val d = 0.018
+            String.format(Locale.US, "[out:json][timeout:18];way[\"highway\"~\"^($hwFilter)$\"](%.5f,%.5f,%.5f,%.5f);out geom;", startLat - d, startLon - d, startLat + d, startLon + d)
+        } else {
+            val sb = StringBuilder()
+            val n = routePoints.length()
+            val step = max(1, n / 16)
+            var idx = 0
+            while (idx < n) {
+                val pt = routePoints.optJSONArray(idx)
+                if (pt != null && pt.length() >= 2) {
+                    if (sb.isNotEmpty()) sb.append(",")
+                    sb.append(String.format(Locale.US, "%.5f,%.5f", pt.optDouble(1), pt.optDouble(0)))
+                }
+                idx += step
+            }
+            val lastPt = routePoints.optJSONArray(n - 1)
+            if (lastPt != null && lastPt.length() >= 2) sb.append(String.format(Locale.US, ",%.5f,%.5f", lastPt.optDouble(1), lastPt.optDouble(0)))
+            String.format(Locale.US, "[out:json][timeout:18];(way[\"highway\"~\"^($hwFilter)$\"](around:380,%s);way[\"highway\"~\"^($hwFilter)$\"](around:1200,%.5f,%.5f););out geom;", sb.toString(), startLat, startLon)
+        }
+
         val scheme = "https"
-        val endpoints = listOf("$scheme://overpass-api.de/api/interpreter", "$scheme://overpass.kumi.systems/api/interpreter")
+        val endpoints = listOf("$scheme://overpass-api.de/api/interpreter", "$scheme://overpass.kumi.systems/api/interpreter", "$scheme://maps.mail.ru/osm/tools/overpass/api/interpreter")
         var body = ""
         for (ep in endpoints) {
             try {
-                val conn = (URL(ep).openConnection() as HttpURLConnection).apply {
-                    connectTimeout = 10000; readTimeout = 12000; requestMethod = "POST"; doOutput = true
+                val urlWithQuery = "$ep?data=" + URLEncoder.encode(query, "UTF-8")
+                val conn = (URL(urlWithQuery).openConnection() as HttpURLConnection).apply {
+                    connectTimeout = 12000; readTimeout = 18000; requestMethod = "GET"
                     setRequestProperty("User-Agent", "PocketNavAndroid/1.0")
                 }
-                conn.outputStream.use { it.write(("data=" + URLEncoder.encode(q, "UTF-8")).toByteArray(Charsets.UTF_8)) }
                 if (conn.responseCode in 200..299) {
-                    body = readStreamSnippet(conn, 900_000); conn.disconnect()
-                    if (body.isNotEmpty()) break
+                    body = readStreamSnippet(conn, 1_800_000); conn.disconnect()
+                    if (body.contains("\"elements\"")) break
                 } else conn.disconnect()
             } catch (_: Exception) {}
         }
@@ -522,7 +625,8 @@ class CommanderActivity : AppCompatActivity() {
             val elements = JSONObject(body).optJSONArray("elements") ?: return null
             val majorF = JSONArray(); val minorF = JSONArray()
             val majorSet = setOf("motorway", "trunk", "primary", "secondary", "tertiary")
-            for (i in 0 until min(elements.length(), 1200)) {
+            val limit = min(elements.length(), 4500)
+            for (i in 0 until limit) {
                 val el = elements.getJSONObject(i)
                 val geom = el.optJSONArray("geometry") ?: continue
                 if (geom.length() < 2) continue
@@ -530,13 +634,20 @@ class CommanderActivity : AppCompatActivity() {
                 val coords = JSONArray()
                 for (j in 0 until geom.length()) {
                     val pt = geom.getJSONObject(j)
-                    coords.put(JSONArray().put(pt.optDouble("lon")).put(pt.optDouble("lat")))
+                    val lon = (pt.optDouble("lon") * 100000.0).roundToInt() / 100000.0
+                    val lat = (pt.optDouble("lat") * 100000.0).roundToInt() / 100000.0
+                    coords.put(JSONArray().put(lon).put(lat))
                 }
                 val feat = JSONObject().put("type", "Feature").put("properties", JSONObject()).put("geometry", JSONObject().put("type", "LineString").put("coordinates", coords))
                 if (majorSet.contains(hw)) majorF.put(feat) else minorF.put(feat)
             }
-            JSONObject().put("majorRoadsGeoJson", JSONObject().put("type", "FeatureCollection").put("features", majorF).toString())
-                .put("minorRoadsGeoJson", JSONObject().put("type", "FeatureCollection").put("features", minorF).toString()).toString()
+            val totalWays = majorF.length() + minorF.length()
+            if (totalWays == 0) return null
+            JSONObject()
+                .put("majorRoadsGeoJson", JSONObject().put("type", "FeatureCollection").put("features", majorF).toString())
+                .put("minorRoadsGeoJson", JSONObject().put("type", "FeatureCollection").put("features", minorF).toString())
+                .put("roadCount", totalWays)
+                .toString()
         } catch (_: Exception) { null }
     }
 
@@ -556,7 +667,7 @@ class CommanderActivity : AppCompatActivity() {
         if (!hasFine && !hasCoarse) return
         try {
             val priority = if (hasFine) Priority.PRIORITY_HIGH_ACCURACY else Priority.PRIORITY_BALANCED_POWER_ACCURACY
-            val req = LocationRequest.Builder(priority, 1000L).setMinUpdateIntervalMillis(1000L).setMaxUpdateDelayMillis(1000L).build()
+            val req = LocationRequest.Builder(priority, 1000L).setMinUpdateIntervalMillis(1000L).setMaxUpdateDelayMillis(1000L).setWaitForAccurateLocation(false).build()
             fusedLocationClient.requestLocationUpdates(req, locationCallback, Looper.getMainLooper())
         } catch (e: Throwable) {
             statusText.text = "Location warning: ${e.message}"
@@ -572,6 +683,7 @@ class CommanderActivity : AppCompatActivity() {
         val idx = deviceSpinner.selectedItemPosition
         if (idx !in pairedDevicesList.indices) return
         val dev = pairedDevicesList[idx]
+        startPocketForegroundService()
         statusText.text = "Status: Connecting to ${dev.name}..."
         toggleStreamButton.isEnabled = false
         ioExecutor.execute {
@@ -581,16 +693,16 @@ class CommanderActivity : AppCompatActivity() {
                 sock.connect()
                 rfcommSocket = sock; dataOutputStream = DataOutputStream(sock.outputStream); isStreaming.set(true)
                 runOnUiThread {
-                    statusText.text = "Status: Connected & Streaming to ${dev.name}"
+                    statusText.text = "Status: Connected & Pocket Streaming to ${dev.name} (Safe to lock screen)"
                     toggleStreamButton.text = "Stop Streaming"; toggleStreamButton.setBackgroundColor(0xFFDC2626.toInt()); toggleStreamButton.isEnabled = true
                 }
-                cachedRouteEnvelopeJson?.let { sendRouteDataPacket(it) }
                 cachedMapRoadsEnvelopeJson?.let { sendMapRoadsPacket(it) }
+                cachedRouteEnvelopeJson?.let { sendRouteDataPacket(it) }
             } catch (e: Throwable) {
                 closeSocketQuietly()
                 runOnUiThread {
                     statusText.text = "Status: Connection failed (${e.message})"
-                    toggleStreamButton.text = "Connect & Start Streaming"; toggleStreamButton.setBackgroundColor(0xFF2563EB.toInt()); toggleStreamButton.isEnabled = true
+                    toggleStreamButton.text = "Connect & Start Pocket Streaming"; toggleStreamButton.setBackgroundColor(0xFF2563EB.toInt()); toggleStreamButton.isEnabled = true
                 }
             }
         }
@@ -615,17 +727,18 @@ class CommanderActivity : AppCompatActivity() {
         isStreaming.set(false); closeSocketQuietly()
         runOnUiThread {
             statusText.text = "Status: Disconnected ($reason)"
-            toggleStreamButton.text = "Connect & Start Streaming"; toggleStreamButton.setBackgroundColor(0xFF2563EB.toInt())
+            toggleStreamButton.text = "Connect & Start Pocket Streaming"; toggleStreamButton.setBackgroundColor(0xFF2563EB.toInt())
         }
     }
 
     private fun stopStreaming() {
         isStreaming.set(false)
+        stopPocketForegroundService()
         ioExecutor.execute {
             closeSocketQuietly()
             runOnUiThread {
                 statusText.text = "Status: Streaming stopped."
-                toggleStreamButton.text = "Connect & Start Streaming"; toggleStreamButton.setBackgroundColor(0xFF2563EB.toInt())
+                toggleStreamButton.text = "Connect & Start Pocket Streaming"; toggleStreamButton.setBackgroundColor(0xFF2563EB.toInt())
             }
         }
     }
@@ -640,16 +753,16 @@ class CommanderActivity : AppCompatActivity() {
         try {
             val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return
             wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PocketNav::CommanderWakeLock").apply {
-                acquire(6 * 60 * 60 * 1000L)
+                setReferenceCounted(false)
+                acquire(12 * 60 * 60 * 1000L)
             }
-        } catch (_: Throwable) {
-            // WAKE_LOCK permission may not be present in manifest; FLAG_KEEP_SCREEN_ON keeps activity awake
-        }
+        } catch (_: Throwable) {}
     }
 
     override fun onDestroy() {
         super.onDestroy()
         isStreaming.set(false)
+        stopPocketForegroundService()
         try { fusedLocationClient.removeLocationUpdates(locationCallback) } catch (_: Throwable) {}
         closeSocketQuietly()
         ioExecutor.shutdownNow(); routeExecutor.shutdownNow()
