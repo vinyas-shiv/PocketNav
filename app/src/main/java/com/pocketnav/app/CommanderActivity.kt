@@ -1,6 +1,4 @@
 package com.pocketnav.app
-package com.pocketnav.app
-
 import android.Manifest
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothDevice
