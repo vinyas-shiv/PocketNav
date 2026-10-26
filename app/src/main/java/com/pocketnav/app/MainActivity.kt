@@ -21,12 +21,6 @@ import java.nio.ByteOrder
 import java.nio.charset.StandardCharsets
 import java.util.UUID
 
-/**
- * Shared RFCOMM service constants and binary framing protocol for:
- *  - Packet Type 0x01 (LOCATION)   : 1-byte header + 24-byte binary GPS telemetry frame
- *  - Packet Type 0x02 (ROUTE_DATA) : 1-byte header + 4-byte Big-Endian length + UTF-8 Route Envelope JSON
- *  - Packet Type 0x03 (MAP_ROADS)  : 1-byte header + 4-byte Big-Endian length + UTF-8 Overpass Roads JSON
- */
 object TelemetryProtocol {
     const val SERVICE_NAME = "PocketNavTelemetry"
     val SERVICE_UUID: UUID = UUID.fromString("8ce255c0-200a-11e0-ac64-0800200c9a66")
@@ -143,17 +137,8 @@ class MainActivity : AppCompatActivity() {
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { results ->
-        val allGranted = results.values.all { it }
-        if (allGranted) {
-            proceedWithRole(pendingRole)
-        } else {
-            Toast.makeText(
-                this,
-                "All requested Bluetooth and Location permissions are required for this role.",
-                Toast.LENGTH_LONG
-            ).show()
-        }
+    ) {
+        proceedWithRole(pendingRole)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -180,7 +165,6 @@ class MainActivity : AppCompatActivity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             requiredPermissions.add(Manifest.permission.BLUETOOTH_CONNECT)
             requiredPermissions.add(Manifest.permission.BLUETOOTH_SCAN)
-            requiredPermissions.add(Manifest.permission.BLUETOOTH_ADVERTISE)
         } else {
             requiredPermissions.add(Manifest.permission.BLUETOOTH)
             requiredPermissions.add(Manifest.permission.BLUETOOTH_ADMIN)
@@ -211,14 +195,14 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        when (role) {
-            Role.COMMANDER -> {
-                startActivity(Intent(this, CommanderActivity::class.java))
+        try {
+            when (role) {
+                Role.COMMANDER -> startActivity(Intent(this, CommanderActivity::class.java))
+                Role.DASHBOARD -> startActivity(Intent(this, DashboardActivity::class.java))
+                null -> Unit
             }
-            Role.DASHBOARD -> {
-                startActivity(Intent(this, DashboardActivity::class.java))
-            }
-            null -> Unit
+        } catch (e: Throwable) {
+            Toast.makeText(this, "Launch error: ${e.message}", Toast.LENGTH_LONG).show()
         }
     }
 }
