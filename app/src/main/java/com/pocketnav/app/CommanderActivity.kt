@@ -1,5 +1,6 @@
 package com.pocketnav.app
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
@@ -7,6 +8,8 @@ import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothSocket
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.os.Looper
 import android.os.PowerManager
@@ -16,10 +19,13 @@ import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import com.google.android.gms.location.*
 import org.json.JSONArray
 import org.json.JSONObject
@@ -69,13 +75,12 @@ class CommanderActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        acquireWakeLock()
+        acquireWakeLockSafely()
         setupCommanderUi()
-        bluetoothAdapter = (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
+        bluetoothAdapter = (getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
         fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
-        populatePairedDevices()
         setupLocationCallback()
-        startHighAccuracyLocationUpdates()
+        ensureRuntimePermissionsAndStart()
         handleIncomingShareIntent(intent)
     }
 
@@ -86,6 +91,10 @@ class CommanderActivity : AppCompatActivity() {
     }
 
     private fun setupCommanderUi() {
+        val scroll = ScrollView(this).apply {
+            setBackgroundColor(0xFF0F172A.toInt())
+            isFillViewport = true
+        }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
@@ -154,17 +163,58 @@ class CommanderActivity : AppCompatActivity() {
             setTextColor(0xFFCBD5E1.toInt())
             setPadding(0, 16, 0, 0)
         }
-        val spacer = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = 20 }
-        root.addView(title); root.addView(subtitle); root.addView(deviceSpinner)
-        root.addView(toggleStreamButton, spacer); root.addView(statusText); root.addView(routeStatusText)
-        root.addView(shareUrlInput); root.addView(sendRouteButton, spacer); root.addView(telemetryText)
-        setContentView(root)
+        val lpToggle = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = 20 }
+        val lpSend = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = 20 }
+        root.addView(title)
+        root.addView(subtitle)
+        root.addView(deviceSpinner)
+        root.addView(toggleStreamButton, lpToggle)
+        root.addView(statusText)
+        root.addView(routeStatusText)
+        root.addView(shareUrlInput)
+        root.addView(sendRouteButton, lpSend)
+        root.addView(telemetryText)
+        scroll.addView(root)
+        setContentView(scroll)
+    }
+
+    private fun ensureRuntimePermissionsAndStart() {
+        val needed = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+                needed.add(Manifest.permission.BLUETOOTH_CONNECT)
+            }
+        }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED
+        ) {
+            needed.add(Manifest.permission.ACCESS_FINE_LOCATION)
+            needed.add(Manifest.permission.ACCESS_COARSE_LOCATION)
+        }
+        if (needed.isNotEmpty()) {
+            ActivityCompat.requestPermissions(this, needed.toTypedArray(), 201)
+        }
+        populatePairedDevices()
+        startHighAccuracyLocationUpdates()
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        populatePairedDevices()
+        startHighAccuracyLocationUpdates()
     }
 
     @SuppressLint("MissingPermission")
     private fun populatePairedDevices() {
         pairedDevicesList.clear()
-        pairedDevicesList.addAll(bluetoothAdapter?.bondedDevices ?: emptySet())
+        val bonded = try {
+            bluetoothAdapter?.bondedDevices ?: emptySet()
+        } catch (_: SecurityException) {
+            emptySet()
+        } catch (_: Throwable) {
+            emptySet()
+        }
+        pairedDevicesList.addAll(bonded)
         val names = if (pairedDevicesList.isEmpty()) listOf("No paired Bluetooth devices found")
         else pairedDevicesList.map { "${it.name ?: "Unknown"} (${it.address})" }
         deviceSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, names)
@@ -228,16 +278,18 @@ class CommanderActivity : AppCompatActivity() {
 
     @SuppressLint("MissingPermission")
     private fun tryLastLocationFallback() {
-        fusedLocationClient.lastLocation.addOnSuccessListener { loc ->
-            if (loc != null && latestLatitude.isNaN()) {
-                latestLatitude = loc.latitude; latestLongitude = loc.longitude
-                if (!pendingDestLat.isNaN() && !pendingDestLon.isNaN()) {
-                    val dLat = pendingDestLat; val dLon = pendingDestLon; val dName = pendingDestName
-                    pendingDestLat = Double.NaN; pendingDestLon = Double.NaN
-                    fetchRouteAndRoadsAndTransmit(loc.latitude, loc.longitude, dLat, dLon, dName)
+        try {
+            fusedLocationClient.lastLocation.addOnSuccessListener { loc ->
+                if (loc != null && latestLatitude.isNaN()) {
+                    latestLatitude = loc.latitude; latestLongitude = loc.longitude
+                    if (!pendingDestLat.isNaN() && !pendingDestLon.isNaN()) {
+                        val dLat = pendingDestLat; val dLon = pendingDestLon; val dName = pendingDestName
+                        pendingDestLat = Double.NaN; pendingDestLon = Double.NaN
+                        fetchRouteAndRoadsAndTransmit(loc.latitude, loc.longitude, dLat, dLon, dName)
+                    }
                 }
             }
-        }
+        } catch (_: Throwable) {}
     }
 
     private fun resolveDestinationFromSharedText(sharedText: String): Triple<Double, Double, String>? {
@@ -499,13 +551,24 @@ class CommanderActivity : AppCompatActivity() {
 
     @SuppressLint("MissingPermission")
     private fun startHighAccuracyLocationUpdates() {
-        val req = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 1000L).setMinUpdateIntervalMillis(1000L).setMaxUpdateDelayMillis(1000L).build()
-        fusedLocationClient.requestLocationUpdates(req, locationCallback, Looper.getMainLooper())
+        val hasFine = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        val hasCoarse = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        if (!hasFine && !hasCoarse) return
+        try {
+            val priority = if (hasFine) Priority.PRIORITY_HIGH_ACCURACY else Priority.PRIORITY_BALANCED_POWER_ACCURACY
+            val req = LocationRequest.Builder(priority, 1000L).setMinUpdateIntervalMillis(1000L).setMaxUpdateDelayMillis(1000L).build()
+            fusedLocationClient.requestLocationUpdates(req, locationCallback, Looper.getMainLooper())
+        } catch (e: Throwable) {
+            statusText.text = "Location warning: ${e.message}"
+        }
     }
 
     @SuppressLint("MissingPermission")
     private fun startStreamingToSelectedDevice() {
-        if (pairedDevicesList.isEmpty()) return
+        if (pairedDevicesList.isEmpty()) {
+            populatePairedDevices()
+            if (pairedDevicesList.isEmpty()) return
+        }
         val idx = deviceSpinner.selectedItemPosition
         if (idx !in pairedDevicesList.indices) return
         val dev = pairedDevicesList[idx]
@@ -513,7 +576,7 @@ class CommanderActivity : AppCompatActivity() {
         toggleStreamButton.isEnabled = false
         ioExecutor.execute {
             try {
-                bluetoothAdapter?.cancelDiscovery()
+                try { bluetoothAdapter?.cancelDiscovery() } catch (_: SecurityException) {}
                 val sock = dev.createRfcommSocketToServiceRecord(TelemetryProtocol.SERVICE_UUID)
                 sock.connect()
                 rfcommSocket = sock; dataOutputStream = DataOutputStream(sock.outputStream); isStreaming.set(true)
@@ -523,7 +586,7 @@ class CommanderActivity : AppCompatActivity() {
                 }
                 cachedRouteEnvelopeJson?.let { sendRouteDataPacket(it) }
                 cachedMapRoadsEnvelopeJson?.let { sendMapRoadsPacket(it) }
-            } catch (e: IOException) {
+            } catch (e: Throwable) {
                 closeSocketQuietly()
                 runOnUiThread {
                     statusText.text = "Status: Connection failed (${e.message})"
@@ -573,17 +636,23 @@ class CommanderActivity : AppCompatActivity() {
         dataOutputStream = null; rfcommSocket = null
     }
 
-    private fun acquireWakeLock() {
-        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PocketNav::CommanderWakeLock").apply { acquire(6 * 60 * 60 * 1000L) }
+    private fun acquireWakeLockSafely() {
+        try {
+            val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PocketNav::CommanderWakeLock").apply {
+                acquire(6 * 60 * 60 * 1000L)
+            }
+        } catch (_: Throwable) {
+            // WAKE_LOCK permission may not be present in manifest; FLAG_KEEP_SCREEN_ON keeps activity awake
+        }
     }
 
     override fun onDestroy() {
         super.onDestroy()
         isStreaming.set(false)
-        fusedLocationClient.removeLocationUpdates(locationCallback)
+        try { fusedLocationClient.removeLocationUpdates(locationCallback) } catch (_: Throwable) {}
         closeSocketQuietly()
         ioExecutor.shutdownNow(); routeExecutor.shutdownNow()
-        wakeLock?.let { if (it.isHeld) it.release() }
+        try { wakeLock?.let { if (it.isHeld) it.release() } } catch (_: Throwable) {}
     }
 }
