@@ -5,7 +5,6 @@ import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothServerSocket
 import android.bluetooth.BluetoothSocket
 import android.content.Context
-import android.graphics.Color
 import android.os.Bundle
 import androidx.appcompat.app.AppCompatActivity
 import org.maplibre.android.MapLibre
@@ -15,13 +14,6 @@ import org.maplibre.android.geometry.LatLng
 import org.maplibre.android.maps.MapLibreMap
 import org.maplibre.android.maps.MapView
 import org.maplibre.android.maps.Style
-import org.maplibre.android.style.layers.LineLayer
-import org.maplibre.android.style.layers.Property
-import org.maplibre.android.style.layers.PropertyFactory.lineCap
-import org.maplibre.android.style.layers.PropertyFactory.lineColor
-import org.maplibre.android.style.layers.PropertyFactory.lineJoin
-import org.maplibre.android.style.layers.PropertyFactory.lineOpacity
-import org.maplibre.android.style.layers.PropertyFactory.lineWidth
 import org.maplibre.android.style.sources.GeoJsonSource
 import java.io.DataInputStream
 import java.io.IOException
@@ -43,8 +35,6 @@ class DashboardActivity : AppCompatActivity() {
 
     companion object {
         private const val ROUTE_SOURCE_ID = "route-source"
-        private const val ROUTE_CASING_LAYER_ID = "route-casing-layer"
-        private const val ROUTE_LINE_LAYER_ID = "route-line-layer"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -65,8 +55,7 @@ class DashboardActivity : AppCompatActivity() {
             map.uiSettings.isRotateGesturesEnabled = true
 
             map.setStyle(Style.Builder().fromJson(buildDarkBaseStyleJson())) { style ->
-                setupRouteGeoJsonSourceAndLineLayer(style)
-                updateOfflineReferenceGrid(style, 12.9716, 77.5946)
+                updateOfflineReferenceGrid(style, 13.066125, 77.506451)
 
                 pendingRouteGeoJson?.let { geoJson ->
                     style.getSourceAs<GeoJsonSource>(ROUTE_SOURCE_ID)?.setGeoJson(geoJson)
@@ -74,8 +63,8 @@ class DashboardActivity : AppCompatActivity() {
                 }
 
                 val initialCam = CameraPosition.Builder()
-                    .target(LatLng(12.9716, 77.5946))
-                    .zoom(17.0)
+                    .target(LatLng(13.066125, 77.506451))
+                    .zoom(16.5)
                     .tilt(45.0)
                     .bearing(0.0)
                     .build()
@@ -86,37 +75,16 @@ class DashboardActivity : AppCompatActivity() {
         startBluetoothRfcommListener()
     }
 
-    private fun setupRouteGeoJsonSourceAndLineLayer(style: Style) {
-        val emptyFeatureCollection = "{\"type\":\"FeatureCollection\",\"features\":[]}"
-        val routeSource = GeoJsonSource(ROUTE_SOURCE_ID, emptyFeatureCollection)
-        style.addSource(routeSource)
-
-        val routeCasingLayer = LineLayer(ROUTE_CASING_LAYER_ID, ROUTE_SOURCE_ID).withProperties(
-            lineColor(Color.parseColor("#185ABC")),
-            lineWidth(14.0f),
-            lineOpacity(0.55f),
-            lineCap(Property.LINE_CAP_ROUND),
-            lineJoin(Property.LINE_JOIN_ROUND)
-        )
-
-        val routeLineLayer = LineLayer(ROUTE_LINE_LAYER_ID, ROUTE_SOURCE_ID).withProperties(
-            lineColor(Color.parseColor("#4285F4")),
-            lineWidth(9.5f),
-            lineOpacity(0.82f),
-            lineCap(Property.LINE_CAP_ROUND),
-            lineJoin(Property.LINE_JOIN_ROUND)
-        )
-
-        style.addLayerBelow(routeCasingLayer, "puck-halo-layer")
-        style.addLayerAbove(routeLineLayer, ROUTE_CASING_LAYER_ID)
-    }
-
     private fun buildDarkBaseStyleJson(): String = """
         {
           "version": 8,
           "name": "PocketNav Dark 3D Style",
           "sources": {
             "grid-source": {
+              "type": "geojson",
+              "data": { "type": "FeatureCollection", "features": [] }
+            },
+            "route-source": {
               "type": "geojson",
               "data": { "type": "FeatureCollection", "features": [] }
             },
@@ -140,6 +108,34 @@ class DashboardActivity : AppCompatActivity() {
               "paint": {
                 "line-color": "#1E293B",
                 "line-width": 1.5
+              }
+            },
+            {
+              "id": "route-casing-layer",
+              "type": "line",
+              "source": "route-source",
+              "layout": {
+                "line-cap": "round",
+                "line-join": "round"
+              },
+              "paint": {
+                "line-color": "#185ABC",
+                "line-width": 14.0,
+                "line-opacity": 0.65
+              }
+            },
+            {
+              "id": "route-line-layer",
+              "type": "line",
+              "source": "route-source",
+              "layout": {
+                "line-cap": "round",
+                "line-join": "round"
+              },
+              "paint": {
+                "line-color": "#4285F4",
+                "line-width": 9.5,
+                "line-opacity": 0.90
               }
             },
             {
@@ -259,18 +255,10 @@ class DashboardActivity : AppCompatActivity() {
     }
 
     private fun onRouteGeoJsonReceived(geoJsonString: String) {
-        val map = mapLibreMap
-        if (map == null) {
-            pendingRouteGeoJson = geoJsonString
-            return
-        }
+        pendingRouteGeoJson = geoJsonString
+        val map = mapLibreMap ?: return
         map.getStyle { style ->
-            val routeSource = style.getSourceAs<GeoJsonSource>(ROUTE_SOURCE_ID)
-            if (routeSource != null) {
-                routeSource.setGeoJson(geoJsonString)
-            } else {
-                pendingRouteGeoJson = geoJsonString
-            }
+            style.getSourceAs<GeoJsonSource>(ROUTE_SOURCE_ID)?.setGeoJson(geoJsonString)
         }
     }
 
@@ -295,14 +283,14 @@ class DashboardActivity : AppCompatActivity() {
 
         val cameraPosition = CameraPosition.Builder()
             .target(LatLng(frame.latitude, frame.longitude))
-            .zoom(17.5)
+            .zoom(16.5)
             .tilt(45.0)
             .bearing(frame.bearing.toDouble())
             .build()
 
         map.animateCamera(
             CameraUpdateFactory.newCameraPosition(cameraPosition),
-            900
+            850
         )
     }
 
