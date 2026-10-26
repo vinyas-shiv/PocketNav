@@ -26,7 +26,6 @@ import org.maplibre.android.style.layers.PropertyFactory
 import org.maplibre.android.style.sources.GeoJsonSource
 import java.io.DataInputStream
 import java.io.EOFException
-import java.io.File
 import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -47,8 +46,6 @@ class DashboardActivity : AppCompatActivity() {
     private lateinit var btnCameraMode: TextView
 
     private var localGridGeoJsonSource: GeoJsonSource? = null
-    private var minorRoadsGeoJsonSource: GeoJsonSource? = null
-    private var majorRoadsGeoJsonSource: GeoJsonSource? = null
     private var routeGeoJsonSource: GeoJsonSource? = null
     private var turnsGeoJsonSource: GeoJsonSource? = null
     private var destGeoJsonSource: GeoJsonSource? = null
@@ -62,7 +59,6 @@ class DashboardActivity : AppCompatActivity() {
     private var listenerThread: Thread? = null
 
     @Volatile private var pendingRouteEnvelopeJson: String? = null
-    @Volatile private var pendingMapRoadsEnvelopeJson: String? = null
     @Volatile private var hasReceivedFirstFix = false
     @Volatile private var isOverviewMode = false
     @Volatile private var lastKnownLat: Double = 12.9716
@@ -70,8 +66,6 @@ class DashboardActivity : AppCompatActivity() {
     @Volatile private var lastKnownBearing: Float = 0.0f
     @Volatile private var lastGridCenterLat: Double = Double.NaN
     @Volatile private var lastGridCenterLon: Double = Double.NaN
-    @Volatile private var cachedRoadCount: Int = 0
-    @Volatile private var currentBtState: String = "WAITING BT"
 
     private data class RouteStep(val lat: Double, val lon: Double, val type: String, val modifier: String, val name: String, val distanceMeters: Double)
     private val routeCoords = mutableListOf<Pair<Double, Double>>()
@@ -85,7 +79,6 @@ class DashboardActivity : AppCompatActivity() {
 
     companion object {
         private const val EMPTY_FC = """{"type":"FeatureCollection","features":[]}"""
-        private const val OFFLINE_ROADS_FILE = "dashboard_offline_roads_cache.json"
         private val OFFLINE_STYLE_JSON = """
             {"version":8,"name":"PocketNav Offline 3D","sources":{"offline-grid":{"type":"geojson","data":${buildGlobalGrid()}}},"layers":[{"id":"bg","type":"background","paint":{"background-color":"#090D16"}},{"id":"grid","type":"line","source":"offline-grid","paint":{"line-color":"#131C2E","line-width":1.0,"line-opacity":0.5}}]}
         """.trimIndent()
@@ -140,9 +133,7 @@ class DashboardActivity : AppCompatActivity() {
             map.setStyle(Style.Builder().fromJson(OFFLINE_STYLE_JSON)) { style ->
                 setupLayers(style)
                 updateLocalMetricGridIfNeeded(lastKnownLat, lastKnownLon)
-                loadOfflineRoadsCacheFromDisk()
                 map.moveCamera(CameraUpdateFactory.newCameraPosition(CameraPosition.Builder().target(LatLng(lastKnownLat, lastKnownLon)).zoom(17.0).tilt(45.0).bearing(0.0).build()))
-                pendingMapRoadsEnvelopeJson?.let { pendingMapRoadsEnvelopeJson = null; applyMapRoadsEnvelope(it, saveToDisk = true) }
                 pendingRouteEnvelopeJson?.let { pendingRouteEnvelopeJson = null; applyRouteDataEnvelope(it) }
             }
         }
@@ -156,34 +147,6 @@ class DashboardActivity : AppCompatActivity() {
             PropertyFactory.lineColor(Color.parseColor("#162238")),
             PropertyFactory.lineWidth(1.2f),
             PropertyFactory.lineOpacity(0.65f)
-        ))
-
-        minorRoadsGeoJsonSource = GeoJsonSource("minor-roads-src", EMPTY_FC).also { style.addSource(it) }
-        style.addLayer(LineLayer("minor-casing", "minor-roads-src").withProperties(
-            PropertyFactory.lineColor(Color.parseColor("#0F172A")),
-            PropertyFactory.lineWidth(10.0f),
-            PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
-            PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND)
-        ))
-        style.addLayer(LineLayer("minor-fill", "minor-roads-src").withProperties(
-            PropertyFactory.lineColor(Color.parseColor("#475569")),
-            PropertyFactory.lineWidth(6.5f),
-            PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
-            PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND)
-        ))
-
-        majorRoadsGeoJsonSource = GeoJsonSource("major-roads-src", EMPTY_FC).also { style.addSource(it) }
-        style.addLayer(LineLayer("major-casing", "major-roads-src").withProperties(
-            PropertyFactory.lineColor(Color.parseColor("#0F172A")),
-            PropertyFactory.lineWidth(14.0f),
-            PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
-            PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND)
-        ))
-        style.addLayer(LineLayer("major-fill", "major-roads-src").withProperties(
-            PropertyFactory.lineColor(Color.parseColor("#64748B")),
-            PropertyFactory.lineWidth(9.5f),
-            PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
-            PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND)
         ))
 
         routeGeoJsonSource = GeoJsonSource("route-src", EMPTY_FC).also { style.addSource(it) }
@@ -277,9 +240,7 @@ class DashboardActivity : AppCompatActivity() {
                     is TelemetryProtocol.IncomingPacket.RouteDataFrame -> runOnUiThread {
                         if (routeGeoJsonSource != null) applyRouteDataEnvelope(pkt.geoJsonString) else pendingRouteEnvelopeJson = pkt.geoJsonString
                     }
-                    is TelemetryProtocol.IncomingPacket.MapRoadsFrame -> runOnUiThread {
-                        if (majorRoadsGeoJsonSource != null) applyMapRoadsEnvelope(pkt.roadsEnvelopeJson, saveToDisk = true) else pendingMapRoadsEnvelopeJson = pkt.roadsEnvelopeJson
-                    }
+                    else -> Unit
                 }
             }
         } catch (_: EOFException) {} catch (_: IOException) {} finally {
@@ -288,10 +249,8 @@ class DashboardActivity : AppCompatActivity() {
     }
 
     private fun updateBadge(btState: String) {
-        currentBtState = btState
         runOnUiThread {
-            val label = if (cachedRoadCount > 0) "$btState • $cachedRoadCount RDS" else btState
-            tvDashboardStatus.text = label
+            tvDashboardStatus.text = btState
             tvDashboardStatus.setTextColor(Color.parseColor(if (btState == "BT LIVE") "#34D399" else if (btState == "BT OFF") "#F87171" else "#38BDF8"))
         }
     }
@@ -343,36 +302,6 @@ class DashboardActivity : AppCompatActivity() {
                 routeCoords.add(Pair(pt.optDouble(1), pt.optDouble(0)))
             }
         } catch (_: Exception) {}
-    }
-
-    private fun applyMapRoadsEnvelope(json: String, saveToDisk: Boolean) {
-        try {
-            val env = JSONObject(json)
-            val majorStr = env.optString("majorRoadsGeoJson", EMPTY_FC)
-            val minorStr = env.optString("minorRoadsGeoJson", EMPTY_FC)
-            majorRoadsGeoJsonSource?.setGeoJson(majorStr)
-            minorRoadsGeoJsonSource?.setGeoJson(minorStr)
-            val count = env.optInt("roadCount", 0).let {
-                if (it > 0) it else (JSONObject(majorStr).optJSONArray("features")?.length() ?: 0) + (JSONObject(minorStr).optJSONArray("features")?.length() ?: 0)
-            }
-            cachedRoadCount = count
-            updateBadge(currentBtState)
-            if (saveToDisk && json.length > 20) {
-                Thread {
-                    try { File(filesDir, OFFLINE_ROADS_FILE).writeText(json, Charsets.UTF_8) } catch (_: Throwable) {}
-                }.start()
-            }
-        } catch (_: Exception) {}
-    }
-
-    private fun loadOfflineRoadsCacheFromDisk() {
-        try {
-            val f = File(filesDir, OFFLINE_ROADS_FILE)
-            if (f.exists() && f.length() > 20) {
-                val json = f.readText(Charsets.UTF_8)
-                applyMapRoadsEnvelope(json, saveToDisk = false)
-            }
-        } catch (_: Throwable) {}
     }
 
     private fun onTelemetryFrame(frame: TelemetryProtocol.IncomingPacket.LocationFrame) {
