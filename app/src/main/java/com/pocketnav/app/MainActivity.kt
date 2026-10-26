@@ -1,236 +1,224 @@
 package com.pocketnav.app
 
 import android.Manifest
-import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
-import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
-import android.widget.ArrayAdapter
 import android.widget.Button
-import android.widget.Spinner
-import android.widget.TextView
+import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
-import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import java.io.DataInputStream
 import java.io.DataOutputStream
+import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.charset.StandardCharsets
 import java.util.UUID
 
+/**
+ * Shared RFCOMM service constants and binary framing protocol for:
+ *  - Packet Type 0x01 (LOCATION)   : 1-byte header + 24-byte binary GPS telemetry frame
+ *  - Packet Type 0x02 (ROUTE_DATA) : 1-byte header + 4-byte Big-Endian length + UTF-8 Route Envelope JSON
+ *  - Packet Type 0x03 (MAP_ROADS)  : 1-byte header + 4-byte Big-Endian length + UTF-8 Overpass Roads JSON
+ */
 object TelemetryProtocol {
-    const val SERVICE_NAME = "PocketNavRFCOMM"
+    const val SERVICE_NAME = "PocketNavTelemetry"
     val SERVICE_UUID: UUID = UUID.fromString("8ce255c0-200a-11e0-ac64-0800200c9a66")
 
-    const val PACKET_TYPE_GPS: Byte = 0x01
+    const val PACKET_TYPE_LOCATION: Byte = 0x01
     const val PACKET_TYPE_ROUTE_DATA: Byte = 0x02
+    const val PACKET_TYPE_MAP_ROADS: Byte = 0x03
     const val GPS_PAYLOAD_SIZE_BYTES = 24
 
-    const val PREFS_NAME = "pocketnav_prefs"
-    const val PREF_KEY_DEVICE_ADDRESS = "target_bt_address"
-    const val EXTRA_DEVICE_ADDRESS = "extra_target_bt_address"
+    sealed class IncomingPacket {
+        data class LocationFrame(
+            val latitude: Double,
+            val longitude: Double,
+            val bearing: Float,
+            val speed: Float
+        ) : IncomingPacket()
 
-    data class TelemetryFrame(
-        val latitude: Double,
-        val longitude: Double,
-        val bearing: Float,
-        val speed: Float
-    )
+        data class RouteDataFrame(
+            val geoJsonString: String
+        ) : IncomingPacket()
 
-    fun encodeGpsPayload(frame: TelemetryFrame): ByteArray {
+        data class MapRoadsFrame(
+            val roadsEnvelopeJson: String
+        ) : IncomingPacket()
+    }
+
+    @Synchronized
+    fun writeLocationPacket(
+        out: DataOutputStream,
+        latitude: Double,
+        longitude: Double,
+        bearing: Float,
+        speed: Float
+    ) {
         val buffer = ByteBuffer.allocate(GPS_PAYLOAD_SIZE_BYTES).order(ByteOrder.BIG_ENDIAN)
-        buffer.putDouble(frame.latitude)
-        buffer.putDouble(frame.longitude)
-        buffer.putFloat(frame.bearing)
-        buffer.putFloat(frame.speed)
-        return buffer.array()
+        buffer.putDouble(latitude)
+        buffer.putDouble(longitude)
+        buffer.putFloat(bearing)
+        buffer.putFloat(speed)
+        out.writeByte(PACKET_TYPE_LOCATION.toInt())
+        out.write(buffer.array())
+        out.flush()
     }
 
-    fun decodeGpsPayload(bytes: ByteArray): TelemetryFrame {
-        val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN)
-        return TelemetryFrame(
-            latitude = buffer.double,
-            longitude = buffer.double,
-            bearing = buffer.float,
-            speed = buffer.float
-        )
+    @Synchronized
+    fun writeRouteDataPacket(out: DataOutputStream, geoJsonOrEnvelope: String) {
+        val utf8Bytes = geoJsonOrEnvelope.toByteArray(StandardCharsets.UTF_8)
+        out.writeByte(PACKET_TYPE_ROUTE_DATA.toInt())
+        out.writeInt(utf8Bytes.size)
+        out.write(utf8Bytes)
+        out.flush()
     }
 
-    fun writeGpsPacket(out: DataOutputStream, frame: TelemetryFrame) {
-        val payload = encodeGpsPayload(frame)
-        synchronized(out) {
-            out.writeByte(PACKET_TYPE_GPS.toInt())
-            out.write(payload)
-            out.flush()
-        }
+    @Synchronized
+    fun writeMapRoadsPacket(out: DataOutputStream, roadsEnvelopeJson: String) {
+        val utf8Bytes = roadsEnvelopeJson.toByteArray(StandardCharsets.UTF_8)
+        out.writeByte(PACKET_TYPE_MAP_ROADS.toInt())
+        out.writeInt(utf8Bytes.size)
+        out.write(utf8Bytes)
+        out.flush()
     }
 
-    fun writeRouteDataPacket(out: DataOutputStream, geoJsonString: String) {
-        val utf8Bytes = geoJsonString.toByteArray(StandardCharsets.UTF_8)
-        synchronized(out) {
-            out.writeByte(PACKET_TYPE_ROUTE_DATA.toInt())
-            out.writeInt(utf8Bytes.size)
-            out.write(utf8Bytes)
-            out.flush()
+    @Throws(IOException::class)
+    fun readNextPacket(input: DataInputStream): IncomingPacket {
+        while (true) {
+            when (val packetType = input.readByte()) {
+                PACKET_TYPE_LOCATION -> {
+                    val payload = ByteArray(GPS_PAYLOAD_SIZE_BYTES)
+                    input.readFully(payload)
+                    val buffer = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN)
+                    return IncomingPacket.LocationFrame(
+                        latitude = buffer.double,
+                        longitude = buffer.double,
+                        bearing = buffer.float,
+                        speed = buffer.float
+                    )
+                }
+                PACKET_TYPE_ROUTE_DATA -> {
+                    val length = input.readInt()
+                    if (length <= 0 || length > 10 * 1024 * 1024) {
+                        throw IOException("Invalid ROUTE_DATA payload length: $length")
+                    }
+                    val payload = ByteArray(length)
+                    input.readFully(payload)
+                    val jsonStr = String(payload, StandardCharsets.UTF_8)
+                    return IncomingPacket.RouteDataFrame(jsonStr)
+                }
+                PACKET_TYPE_MAP_ROADS -> {
+                    val length = input.readInt()
+                    if (length <= 0 || length > 15 * 1024 * 1024) {
+                        throw IOException("Invalid MAP_ROADS payload length: $length")
+                    }
+                    val payload = ByteArray(length)
+                    input.readFully(payload)
+                    val jsonStr = String(payload, StandardCharsets.UTF_8)
+                    return IncomingPacket.MapRoadsFrame(jsonStr)
+                }
+                else -> {
+                    throw IOException("Unknown packet type header: $packetType")
+                }
+            }
         }
     }
 }
 
 class MainActivity : AppCompatActivity() {
 
-    private lateinit var spinnerPairedDevices: Spinner
-    private lateinit var btnStartCommander: Button
-    private lateinit var btnStartDashboard: Button
-    private lateinit var tvCommanderStatus: TextView
-    private lateinit var tvTelemetryReadout: TextView
+    private var pendingRole: Role? = null
 
-    private var pairedDevicesList: List<BluetoothDevice> = emptyList()
+    private enum class Role {
+        COMMANDER,
+        DASHBOARD
+    }
 
-    companion object {
-        private const val REQ_PERMISSIONS_COMMANDER = 101
-        private const val REQ_PERMISSIONS_DASHBOARD = 102
+    private val permissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { results ->
+        val allGranted = results.values.all { it }
+        if (allGranted) {
+            proceedWithRole(pendingRole)
+        } else {
+            Toast.makeText(
+                this,
+                "All requested Bluetooth and Location permissions are required for this role.",
+                Toast.LENGTH_LONG
+            ).show()
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        spinnerPairedDevices = findViewById(R.id.spinnerPairedDevices)
-        btnStartCommander = findViewById(R.id.btnStartCommander)
-        btnStartDashboard = findViewById(R.id.btnStartDashboard)
-        tvCommanderStatus = findViewById(R.id.tvCommanderStatus)
-        tvTelemetryReadout = findViewById(R.id.tvTelemetryReadout)
-
-        populatePairedDevicesIfPermitted()
+        val btnStartCommander = findViewById<Button>(R.id.btnStartCommander)
+        val btnStartDashboard = findViewById<Button>(R.id.btnStartDashboard)
 
         btnStartCommander.setOnClickListener {
-            if (hasCommanderPermissions()) {
-                populatePairedDevicesIfPermitted()
-                launchCommanderActivity()
-            } else {
-                requestCommanderPermissions()
-            }
+            pendingRole = Role.COMMANDER
+            checkAndRequestPermissions(Role.COMMANDER)
         }
 
         btnStartDashboard.setOnClickListener {
-            if (hasDashboardPermissions()) {
-                launchDashboardActivity()
-            } else {
-                requestDashboardPermissions()
+            pendingRole = Role.DASHBOARD
+            checkAndRequestPermissions(Role.DASHBOARD)
+        }
+    }
+
+    private fun checkAndRequestPermissions(role: Role) {
+        val requiredPermissions = mutableListOf<String>()
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            requiredPermissions.add(Manifest.permission.BLUETOOTH_CONNECT)
+            requiredPermissions.add(Manifest.permission.BLUETOOTH_SCAN)
+            requiredPermissions.add(Manifest.permission.BLUETOOTH_ADVERTISE)
+        } else {
+            requiredPermissions.add(Manifest.permission.BLUETOOTH)
+            requiredPermissions.add(Manifest.permission.BLUETOOTH_ADMIN)
+        }
+
+        if (role == Role.COMMANDER) {
+            requiredPermissions.add(Manifest.permission.ACCESS_FINE_LOCATION)
+            requiredPermissions.add(Manifest.permission.ACCESS_COARSE_LOCATION)
+        }
+
+        val missing = requiredPermissions.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+
+        if (missing.isEmpty()) {
+            proceedWithRole(role)
+        } else {
+            permissionLauncher.launch(missing.toTypedArray())
+        }
+    }
+
+    private fun proceedWithRole(role: Role?) {
+        val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+        val bluetoothAdapter: BluetoothAdapter? = bluetoothManager?.adapter
+
+        if (bluetoothAdapter == null) {
+            Toast.makeText(this, "Bluetooth is not supported on this device.", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        when (role) {
+            Role.COMMANDER -> {
+                startActivity(Intent(this, CommanderActivity::class.java))
             }
-        }
-    }
-
-    private fun getBluetoothAdapter(): BluetoothAdapter? =
-        (getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
-
-    private fun hasCommanderPermissions(): Boolean {
-        val fineLoc = ContextCompat.checkSelfPermission(
-            this, Manifest.permission.ACCESS_FINE_LOCATION
-        ) == PackageManager.PERMISSION_GRANTED
-        val btConnect = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            ContextCompat.checkSelfPermission(
-                this, Manifest.permission.BLUETOOTH_CONNECT
-            ) == PackageManager.PERMISSION_GRANTED
-        } else true
-        return fineLoc && btConnect
-    }
-
-    private fun requestCommanderPermissions() {
-        val perms = mutableListOf(
-            Manifest.permission.ACCESS_FINE_LOCATION,
-            Manifest.permission.ACCESS_COARSE_LOCATION
-        )
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            perms.add(Manifest.permission.BLUETOOTH_CONNECT)
-            perms.add(Manifest.permission.BLUETOOTH_SCAN)
-        }
-        ActivityCompat.requestPermissions(this, perms.toTypedArray(), REQ_PERMISSIONS_COMMANDER)
-    }
-
-    private fun hasDashboardPermissions(): Boolean =
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            ContextCompat.checkSelfPermission(
-                this, Manifest.permission.BLUETOOTH_CONNECT
-            ) == PackageManager.PERMISSION_GRANTED
-        } else true
-
-    private fun requestDashboardPermissions() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            ActivityCompat.requestPermissions(
-                this,
-                arrayOf(
-                    Manifest.permission.BLUETOOTH_CONNECT,
-                    Manifest.permission.BLUETOOTH_ADVERTISE
-                ),
-                REQ_PERMISSIONS_DASHBOARD
-            )
-        } else {
-            launchDashboardActivity()
-        }
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun populatePairedDevicesIfPermitted() {
-        if (!hasDashboardPermissions()) return
-        val bonded = getBluetoothAdapter()?.bondedDevices?.toList() ?: emptyList()
-        pairedDevicesList = bonded
-        val labels = if (bonded.isEmpty()) {
-            listOf("No paired Bluetooth devices found (Pair Phone 2 in Settings)")
-        } else {
-            bonded.map { "${it.name ?: "Unknown"} (${it.address})" }
-        }
-        spinnerPairedDevices.adapter = ArrayAdapter(
-            this,
-            android.R.layout.simple_spinner_dropdown_item,
-            labels
-        )
-    }
-
-    private fun launchCommanderActivity() {
-        val idx = spinnerPairedDevices.selectedItemPosition
-        val selectedDevice = if (idx in pairedDevicesList.indices) {
-            pairedDevicesList[idx]
-        } else {
-            pairedDevicesList.firstOrNull()
-        }
-
-        val address = selectedDevice?.address
-        if (address != null) {
-            getSharedPreferences(TelemetryProtocol.PREFS_NAME, Context.MODE_PRIVATE)
-                .edit()
-                .putString(TelemetryProtocol.PREF_KEY_DEVICE_ADDRESS, address)
-                .apply()
-        }
-
-        val intent = Intent(this, CommanderActivity::class.java).apply {
-            if (address != null) {
-                putExtra(TelemetryProtocol.EXTRA_DEVICE_ADDRESS, address)
+            Role.DASHBOARD -> {
+                startActivity(Intent(this, DashboardActivity::class.java))
             }
-        }
-        startActivity(intent)
-    }
-
-    private fun launchDashboardActivity() {
-        startActivity(Intent(this, DashboardActivity::class.java))
-    }
-
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<out String>,
-        grantResults: IntArray
-    ) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == REQ_PERMISSIONS_COMMANDER && hasCommanderPermissions()) {
-            populatePairedDevicesIfPermitted()
-            launchCommanderActivity()
-        } else if (requestCode == REQ_PERMISSIONS_DASHBOARD && hasDashboardPermissions()) {
-            launchDashboardActivity()
+            null -> Unit
         }
     }
 }
